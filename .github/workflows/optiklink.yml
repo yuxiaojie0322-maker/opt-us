@@ -1,0 +1,191 @@
+name: OptikLink 每日自动登录+服务器保活
+
+on:
+  schedule:
+    - cron: '0 1 */3 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  auto-login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          pip install requests cloudscraper "requests[socks]" seleniumbase pyvirtualdisplay
+
+      - name: 安装浏览器依赖（Turnstile 需要真实 Chrome + 虚拟显示）
+        run: |
+          set -uo pipefail
+          sudo apt-get update -qq
+          # 22.04 和 24.04 包名不同（24.04 加 t64 后缀），两个名字都试
+          for p in xvfb libnss3 libdrm2 libxkbcommon0 libgbm1 fonts-liberation \
+                   libglib2.0-0 libglib2.0-0t64 libatk1.0-0 libatk1.0-0t64 \
+                   libatk-bridge2.0-0 libatk-bridge2.0-0t64 libcups2 libcups2t64 \
+                   libasound2 libasound2t64; do
+            sudo apt-get install -y -qq "$p" >/dev/null 2>&1 && echo "  ✅ $p" || echo "  ⚠️ $p 跳过"
+          done
+          python -m seleniumbase install || echo "⚠️ SB 内置浏览器安装失败，运行时再试"
+          python -c "import seleniumbase; print('✅ seleniumbase', seleniumbase.__version__)"
+
+      - name: 下载并启动 Xray 代理
+        env:
+          VLESS_NODE: ${{ secrets.VLESS_NODE }}
+        run: |
+          set -euo pipefail
+
+          # 安装工具
+          sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq jq netcat-openbsd >/dev/null 2>&1
+
+          # 下载并安装 Xray 至系统可执行目录，避免因目录或 Trap 误删
+          curl -sL --fail -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          sudo unzip -q -o /tmp/xray.zip xray -d /usr/local/bin/ && sudo chmod +x /usr/local/bin/xray
+          rm -f /tmp/xray.zip
+
+          # 检查 VLESS_NODE
+          if [ -z "$VLESS_NODE" ]; then
+            echo "❌ 错误: 未设置 VLESS_NODE 环境变量"
+            exit 1
+          fi
+          echo "🔄 正在解析 VLESS 链接..."
+
+          # 生成配置到 /tmp
+          python3 generate_xray_config.py > /tmp/xray_config.json
+
+          # 验证配置
+          if ! jq . /tmp/xray_config.json >/dev/null 2>&1; then
+            echo "❌ 生成的配置无效"
+            cat /tmp/xray_config.json
+            exit 1
+          fi
+          
+          NODE_ADDR=$(jq -r '.outbounds[0].settings.vnext[0].address' /tmp/xray_config.json)
+          NODE_PORT=$(jq -r '.outbounds[0].settings.vnext[0].port' /tmp/xray_config.json)
+          echo "✅ 配置生成成功: ${NODE_ADDR}:${NODE_PORT}"
+
+          # 守护进程模式启动 Xray (nohup + disown 防止 shell 退出时 SIGHUP 中断)
+          nohup /usr/local/bin/xray run -c /tmp/xray_config.json > /tmp/xray.log 2>&1 &
+          disown
+
+          # 等待端口就绪
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10808 2>/dev/null; then
+              echo "✅ 代理本地端口已就绪 (耗时 ${i} 秒)"
+              break
+            fi
+            sleep 1
+          done
+          
+          if ! nc -z 127.0.0.1 10808 2>/dev/null; then
+            echo "❌ 端口未就绪，Xray 日志："
+            cat /tmp/xray.log
+            exit 1
+          fi
+
+          # 测试代理连接
+          echo "🔄 测试代理出口连接..."
+          PROXY_IP=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org || echo "")
+          if [ -n "$PROXY_IP" ]; then
+            echo "✅ 代理工作正常，真实出口 IP: $PROXY_IP"
+          else
+            echo "❌ 代理出口测试失败，请检查节点是否可用！Xray 日志："
+            tail -n 30 /tmp/xray.log
+            exit 1
+          fi
+
+      - name: 执行自动登录+服务器保活脚本
+        id: login
+        env:
+          DISCORD_TOKEN:        ${{ secrets.DISCORD_TOKEN }}
+          BOT_TOKEN:            ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:              ${{ secrets.CHAT_ID }}
+          DISCORD_CLIENT_ID:    ${{ secrets.DISCORD_CLIENT_ID }}
+          DISCORD_REDIRECT_URI: ${{ secrets.DISCORD_REDIRECT_URI }}
+          EXPIRE_DATE:          ${{ secrets.EXPIRE_DATE }}
+          PROXY_URL:            'socks5h://127.0.0.1:10808'
+          PANEL_API_KEY:        ${{ secrets.PANEL_API_KEY }}
+          PANEL_SERVER_ID:      ${{ secrets.PANEL_SERVER_ID }}
+          PANEL_URL:            "https://control.optiklink.net"
+          SERVER_START_WAIT:    "60"
+        run: |
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python -u optiklink_login.py
+
+      - name: 自动更新 DISCORD_CLIENT_ID Secret
+        if: steps.login.outputs.new_client_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_CID:  ${{ steps.login.outputs.new_client_id }}
+        run: |
+          echo "检测到新 client_id，正在自动更新 Secret..."
+          gh secret set DISCORD_CLIENT_ID --body "$NEW_CID" --repo "$GITHUB_REPOSITORY"
+          echo "✅ Secret DISCORD_CLIENT_ID 已自动更新"
+
+      - name: 提交 time.txt 保持仓库活跃
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "无变化，无需提交"
+          else
+            git commit -m "⏱️ 更新时间文件: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD
+          fi
+
+  cleanup-old-runs:
+    runs-on: ubuntu-latest
+    needs: auto-login
+    if: always()
+    permissions:
+      actions: write
+    steps:
+      - name: 删除多余的 workflow run（保留最新 2 条）
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const KEEP = 2;
+            const workflowName = "OptikLink 每日自动登录+服务器保活";
+            const workflows = await github.rest.actions.listRepoWorkflows({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+            });
+            const wf = workflows.data.workflows.find(w => w.name === workflowName);
+            if (!wf) {
+              console.log("未找到 workflow，跳过清理");
+              return;
+            }
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                workflow_id: wf.id,
+                per_page:    100,
+              }
+            );
+            const toDelete = runs.slice(KEEP);
+            console.log(`共 ${runs.length} 条 run，保留 ${KEEP} 条，删除 ${toDelete.length} 条`);
+            for (const run of toDelete) {
+              await github.rest.actions.deleteWorkflowRun({
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                run_id: run.id,
+              });
+              console.log(`已删除 run #${run.run_number} (id=${run.id})`);
+            }
